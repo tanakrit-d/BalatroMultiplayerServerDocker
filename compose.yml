@@ -1,0 +1,127 @@
+name: balatro-mp-server
+
+x-api: &api
+  image: ${IMAGE_PREFIX:?Set IMAGE_PREFIX}-api:${BMP_VERSION:?Set BMP_VERSION}
+  environment: &api-env
+    BMP_SERVER_KIND: community
+    DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/bmp
+    JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET}
+    PLAYER_ID_SALT: ${PLAYER_ID_SALT:?Set PLAYER_ID_SALT}
+    ADMIN_SECRET: ${ADMIN_SECRET:?Set ADMIN_SECRET}
+    STEAM_WEB_API_KEY: ${STEAM_WEB_API_KEY:-}
+    WEB_BASE_URL: ${WEB_BASE_URL:-http://localhost:3000}
+    NAKAMA_URL: http://nakama:7350
+    NAKAMA_SERVER_KEY: defaultkey
+    NAKAMA_HTTP_KEY: ${NAKAMA_HTTP_KEY:?Set NAKAMA_HTTP_KEY}
+    NAKAMA_METRICS_URL: http://nakama:9100/
+    INTERNAL_API_KEY: ${INTERNAL_API_KEY:?Set INTERNAL_API_KEY}
+
+services:
+  postgres:
+    image: postgres:16-alpine@sha256:aa6cb33cf4c19c765cefcf48d96176258800870a9a1e930ad126200f9d825139
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      POSTGRES_DB: bmp
+    volumes:
+      - ${APPDATA_DIR:-/mnt/user/appdata/balatro-mp-server}/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U postgres]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  nakama:
+    image: ${IMAGE_PREFIX:?Set IMAGE_PREFIX}-nakama:${BMP_VERSION:?Set BMP_VERSION}
+    environment:
+      DATABASE_ADDRESS: postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/nakama
+      NAKAMA_SESSION_KEY: ${NAKAMA_SESSION_KEY:?Set NAKAMA_SESSION_KEY}
+      NAKAMA_REFRESH_KEY: ${NAKAMA_REFRESH_KEY:?Set NAKAMA_REFRESH_KEY}
+      NAKAMA_HTTP_KEY: ${NAKAMA_HTTP_KEY:?Set NAKAMA_HTTP_KEY}
+      NAKAMA_CONSOLE_PASSWORD: ${NAKAMA_CONSOLE_PASSWORD:?Set NAKAMA_CONSOLE_PASSWORD}
+      NAKAMA_CONSOLE_SIGNING_KEY: ${NAKAMA_CONSOLE_SIGNING_KEY:?Set NAKAMA_CONSOLE_SIGNING_KEY}
+      PLAYER_ID_SALT: ${PLAYER_ID_SALT:?Set PLAYER_ID_SALT}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?Set INTERNAL_API_KEY}
+      STEAM_WEB_API_KEY: ${STEAM_WEB_API_KEY:-}
+      LOBBY_GRACE_SECONDS: ${LOBBY_GRACE_SECONDS:-}
+      RESULT_TIMEOUT_SECONDS: ${RESULT_TIMEOUT_SECONDS:-}
+      LOBBY_CATCH_UP_LIMIT_SECONDS: ${LOBBY_CATCH_UP_LIMIT_SECONDS:-}
+      MODERATION_REMOTE: ${MODERATION_REMOTE:-}
+      MODERATION_BEARER_TOKEN: ${MODERATION_BEARER_TOKEN:-}
+    ports:
+      - "${NAKAMA_BIND_ADDRESS:-0.0.0.0}:${NAKAMA_PORT:-7350}:7350"
+      - "127.0.0.1:${CONSOLE_PORT:-7351}:7351"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, /nakama/nakama, healthcheck]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  migrate:
+    <<: *api
+    profiles: [api, web]
+    command: [pnpm, --filter, balatro-multiplayer-api-server, migrate]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *api
+    profiles: [api, web]
+    ports:
+      - "127.0.0.1:${API_PORT:-8788}:8788"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      nakama:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://localhost:8788/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+
+  web:
+    image: ${IMAGE_PREFIX:?Set IMAGE_PREFIX}-web:${BMP_VERSION:?Set BMP_VERSION}
+    profiles: [web]
+    environment:
+      API_SERVER_URL: http://api:8788
+      HOSTNAME: 0.0.0.0
+    ports:
+      - "${WEB_BIND_ADDRESS:-0.0.0.0}:${WEB_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
+  moderation:
+    image: ${IMAGE_PREFIX:?Set IMAGE_PREFIX}-moderation:${BMP_VERSION:?Set BMP_VERSION}
+    profiles: [moderation]
+    environment:
+      SHADOW_MODE: ${SHADOW_MODE:-1}
+      GUARD_THREADS: ${MODERATION_GUARD_THREADS:-2}
+      MODERATION_BEARER_TOKEN: ${MODERATION_BEARER_TOKEN:-}
+    volumes:
+      - ${APPDATA_DIR:-/mnt/user/appdata/balatro-mp-server}/moderation-model-cache:/model-cache
+    networks:
+      default:
+        aliases: [moderation-lb]
+    restart: unless-stopped
