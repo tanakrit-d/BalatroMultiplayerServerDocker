@@ -20,6 +20,8 @@ Players connect on port `7350` with key `defaultkey`. Data lives in
 Back up `.env` and databases. Replace `compose.yml` with the next release's file,
 retain `.env` and appdata, then rerun the commands above.
 
+Use the repository's `compose.yml` with `BMP_VERSION=latest` to follow releases.
+
 ## Publish
 
 Actions publishes tested images to GHCR daily, on `main` pushes, or manually.

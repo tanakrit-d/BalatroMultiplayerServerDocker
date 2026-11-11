@@ -60,7 +60,6 @@ jobs:
         run: python3 scripts/package.py smoke
       - name: Sign in to GHCR
         if: >-
-          steps.plan.outputs.needed == 'true' &&
           github.event_name != 'pull_request' &&
           github.ref == 'refs/heads/main' &&
           github.repository_owner == 'tanakrit-d'
@@ -78,3 +77,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/package.py publish
+      - name: Promote latest aliases for the newest successful release
+        if: >-
+          github.event_name != 'pull_request' &&
+          github.ref == 'refs/heads/main' &&
+          github.repository_owner == 'tanakrit-d'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/package.py latest

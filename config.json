@@ -1,6 +1,6 @@
 {
   "upstream": "Balatro-Multiplayer/BalatroMultiplayerServer",
-  "packaging_revision": 3,
+  "packaging_revision": 4,
   "platform": "linux/amd64",
   "bases": {
     "node": "node:26-alpine@sha256:8996bb5821d62a8fd9bb27c1cb07462f3fdce6e47d640c6a881ead0b064ce216",

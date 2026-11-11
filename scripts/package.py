@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / '.build'
 SERVICES = ('nakama', 'api', 'web', 'moderation')
 TAG = re.compile(r'^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$')
+PACKAGE_TAG = re.compile(r'^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-r([1-9]\d*)$')
 
 
 def run(*args, capture=False, **kwargs):
@@ -35,6 +36,13 @@ def version_key(tag):
     match = TAG.fullmatch(tag)
     if not match:
         raise ValueError(f'Not a stable version tag: {tag}')
+    return tuple(map(int, match.groups()))
+
+
+def package_version_key(version):
+    match = PACKAGE_TAG.fullmatch(version)
+    if not match:
+        raise ValueError(f'Not a versioned image tag: {version}')
     return tuple(map(int, match.groups()))
 
 
@@ -64,20 +72,26 @@ def save(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
 
 
-def find_release(repository, version):
-    # Enumerate authenticated results so drafts also reserve their version.
-    matches = []
+def list_releases(repository):
+    # Authenticated results include drafts, which reserve their version.
+    result = []
     page = 1
     while True:
         releases = api(f'repos/{repository}/releases?per_page=100&page={page}', missing=True)
         if releases is None:
             if page > 1:
                 raise RuntimeError('Repository became inaccessible while checking releases')
-            return None
-        matches.extend(release for release in releases if release['tag_name'] == version)
+            return []
+        result.extend(releases)
         if len(releases) < 100:
-            break
+            return result
         page += 1
+
+
+def find_release(repository, version, releases=None):
+    if releases is None:
+        releases = list_releases(repository)
+    matches = [release for release in releases if release['tag_name'] == version]
     if len(matches) > 1:
         raise ValueError(f'Multiple releases reserve {version}; resolve the duplicate releases first')
     return matches[0] if matches else None
@@ -94,6 +108,7 @@ def verify_release(release, plan):
             raise ValueError(f'Published {key} changed; bump packaging_revision')
     if set(previous.get('images', {})) != set(SERVICES):
         raise ValueError('Published release has an incomplete image set')
+    return previous
 
 
 def plan(tag, repository):
@@ -265,12 +280,17 @@ def inspect_local_image(plan, service):
     return info['Id']
 
 
-def verify_registry_manifest(ref, expected_config):
+def registry_manifest(ref):
     manifest = json.loads(run('docker', 'buildx', 'imagetools', 'inspect', ref, '--raw', capture=True))
     allowed = ('application/vnd.oci.image.manifest.v1+json',
                'application/vnd.docker.distribution.manifest.v2+json')
     if manifest.get('mediaType') not in allowed or 'manifests' in manifest or 'artifactType' in manifest:
         raise ValueError(f'{ref} must contain one image manifest without attestation attachments')
+    return manifest
+
+
+def verify_registry_manifest(ref, expected_config):
+    manifest = registry_manifest(ref)
     if manifest.get('config', {}).get('digest') != expected_config:
         raise ValueError(f'{ref} does not match the validated local image')
 
@@ -357,13 +377,14 @@ def smoke():
         run(*command, 'down', '--volumes', '--remove-orphans')
 
 
-def assert_absent(ref):
+def registry_tag(ref):
     # GHCR returns "denied" for a package that has never existed. Use the
     # authenticated Packages API instead of treating registry errors as absence.
     match = re.fullmatch(r'ghcr.io/(tanakrit-d)/([a-z0-9_.-]+):([a-z0-9_.-]+)', ref)
     if not match:
         raise ValueError(f'Unexpected image destination: {ref}')
     owner, package, tag = match.groups()
+    found = None
     page = 1
     while True:
         versions = api(f'users/{owner}/packages/container/{package}/versions?per_page=100&page={page}',
@@ -374,10 +395,73 @@ def assert_absent(ref):
             return
         for version in versions:
             if tag in version['metadata']['container']['tags']:
-                raise ValueError(f'{ref} already exists; bump packaging_revision (never overwrite)')
+                if found is not None:
+                    raise ValueError(f'Multiple registry versions carry {ref}')
+                found = version
         if len(versions) < 100:
-            return
+            return found
         page += 1
+
+
+def assert_absent(ref):
+    if registry_tag(ref) is not None:
+        raise ValueError(f'{ref} already exists; bump packaging_revision (never overwrite)')
+
+
+def latest():
+    plan = load_plan()
+    repository = plan['packaging_repository']
+    releases = list_releases(repository)
+    release = find_release(repository, plan['version'], releases)
+    if release is None:
+        raise ValueError('A completed release is required before promoting latest')
+    manifest = verify_release(release, plan)
+    candidate = package_version_key(plan['version'])
+    successful = [package_version_key(item['tag_name']) for item in releases
+                  if not item['draft'] and not item['prerelease'] and PACKAGE_TAG.fullmatch(item['tag_name'])]
+    if candidate < max(successful, default=candidate):
+        print(f"Skipping latest for {plan['version']}: a newer release is published")
+        return
+
+    # Preflight the complete set before changing the first alias.
+    sources = {}
+    current = {}
+    for service in SERVICES:
+        ref = manifest['images'][service]
+        expected = re.escape(f"{plan['image_prefix']}-{service}") + r'@sha256:[0-9a-f]{64}'
+        if not re.fullmatch(expected, ref):
+            raise ValueError(f'Unexpected published image reference for {service}')
+        config = registry_manifest(ref).get('config', {}).get('digest', '')
+        if not re.fullmatch(r'sha256:[0-9a-f]{64}', config):
+            raise ValueError(f'Invalid image config for {ref}')
+        alias = f"{plan['image_prefix']}-{service}:latest"
+        tagged = registry_tag(alias)
+        if tagged:
+            versions = [package_version_key(tag) for tag in tagged['metadata']['container']['tags']
+                        if PACKAGE_TAG.fullmatch(tag)]
+            if not versions:
+                raise ValueError(f'Cannot identify the version currently tagged {alias}')
+            newest = max(versions)
+            if newest > candidate:
+                print(f'Skipping latest: {alias} already references a newer version')
+                return
+            if newest == candidate and tagged['name'] != ref.split('@')[1]:
+                raise ValueError(f'{alias} conflicts with the immutable version digest')
+        sources[service] = (ref, config)
+        current[service] = tagged
+
+    for service, (ref, config) in sources.items():
+        alias = f"{plan['image_prefix']}-{service}:latest"
+        digest = ref.split('@')[1]
+        if not current[service] or current[service]['name'] != digest:
+            # Copy the existing manifest verbatim, preserving its digest and shape.
+            run('docker', 'buildx', 'imagetools', 'create', '--prefer-index=false', '--tag', alias, ref)
+        actual = run('docker', 'buildx', 'imagetools', 'inspect', alias,
+                     '--format', '{{.Manifest.Digest}}', capture=True).strip()
+        if actual != digest:
+            raise ValueError(f'{alias} did not retain the versioned image digest')
+        verify_registry_manifest(alias, config)
+    print(f"Latest aliases match {plan['version']}")
 
 
 def publish():
@@ -439,7 +523,7 @@ def publish():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('plan', 'prepare', 'build', 'smoke', 'publish'))
+    parser.add_argument('command', choices=('plan', 'prepare', 'build', 'smoke', 'publish', 'latest'))
     parser.add_argument('--tag', default='')
     parser.add_argument('--repository', default=os.environ.get('GITHUB_REPOSITORY',
                                                                'tanakrit-d/BalatroMultiplayerServerDocker'))
